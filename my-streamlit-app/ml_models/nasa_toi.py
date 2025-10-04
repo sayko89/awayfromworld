@@ -1,199 +1,91 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, cross_val_predict
-from sklearn.preprocessing import StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (classification_report, confusion_matrix, ConfusionMatrixDisplay,
-                             roc_auc_score, RocCurveDisplay, precision_recall_curve,
-                             average_precision_score, PrecisionRecallDisplay, f1_score,
-                             make_scorer, balanced_accuracy_score)
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.inspection import permutation_importance
-from sklearn.dummy import DummyClassifier
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
-from sklearn.model_selection import RandomizedSearchCV
-from scipy.stats import randint, uniform
-pd.set_option('display.max_columns', None)
+import os
+from typing import Optional, Tuple
 
-# Gerekli importlar eklendi
+# -------------------- UI Setup --------------------
+st.set_page_config(page_title="TESS / TOI Exoplanet Classifier", page_icon="🛰️", layout="wide")
+st.title("🛰️ TESS / TOI Exoplanet Classifier (SMOTE + RandomForest)")
 
-# ====================================================================
-# BÖLÜM 1: Veri Yükleme ve Hazırlık (Orijinal hali korunmuştur)
-# ====================================================================
+with st.sidebar:
+    st.header("Ayarlar")
+    default_url = "https://www.kaggle.com/datasets/nasa/toi-catalog"  # kullanıcı kendi URL'sini girebilir
+    kaggle_url = st.text_input("Kaggle Dataset URL", value=default_url)
+    use_kaggle = st.checkbox("Açılışta Kaggle'dan indir", value=True)
+    st.caption("Not: Kaggle indirmesi için kimlik doğrulama gerekir (kaggle.json / opendatasets).")
+    test_size = st.slider("Test oranı", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
+    random_state = st.number_input("Rastgele tohum (random_state)", min_value=0, value=42, step=1)
 
-# Sürücü bağlama ve veri okuma kısmı (Colab ortamına özeldir, burada çalıştırılmaz)
-# path = "/content/drive/MyDrive/Makine_öğrenmesi/NASA/işlenmiş TOI.csv"
-# from google.colab import drive
-# drive.mount('/content/drive')
-# df = pd.read_csv(path)
+DATA_DIR = "./data_toi"
 
-# ÖRNEK VERİ OLUŞTURMA (Kodun bu kısımda çalışabilmesi için)
-try:
-    path = "/content/drive/MyDrive/Makine_öğrenmesi/NASA/işlenmiş TOI.csv"
-    from google.colab import drive
-    drive.mount('/content/drive')
-    df = pd.read_csv(path)
-except:
-    # Gerçek veri yoksa örnek bir DataFrame oluştur
-    print("ÖRNEK VERİ SETİ OLUŞTURULUYOR: Gerçek veri yolu bulunamadı.")
-    data = {
-        'rowid': range(100), 'toi': range(1, 101), 'toipfx': ['T'] * 100,
-        'tid': range(1000, 1100), 'ctoi_alias': [f'C{i}' for i in range(100)],
-        'rastr': ['10h'] * 100, 'decstr': ['+30d'] * 100,
-        'tfopwg_disp': ['FP'] * 50 + ['PLANET'] * 50,
-        'pl_trandep': np.random.rand(100), 'pl_trandurh': np.random.rand(100) * 10,
-        'pl_orbper': np.random.rand(100) * 100, 'pl_insol': np.random.rand(100) * 5,
-        'st_rad': np.random.rand(100), 'st_teff': np.random.rand(100) * 5000 + 3000,
-        # Diğer sayısal kolonlar
-        'feature1': np.random.rand(100), 'feature2': np.random.randn(100)
-    }
-    df = pd.DataFrame(data)
-    df.loc[::10, ['pl_trandep', 'pl_trandurh']] = np.nan # Eksik değerler ekle
+# -------------------- Helpers --------------------
+def try_kaggle_download(url: str, data_dir: str) -> Optional[str]:
+    """
+    Tries to download a Kaggle dataset using opendatasets.
+    Returns a path to a CSV file if found, else None.
+    """
+    try:
+        import opendatasets as od  # pip install opendatasets
+        if not os.path.exists(data_dir):
+            st.info("⏬ Kaggle'dan veri indiriliyor... (ilk çalıştırmada biraz sürebilir)")
+            od.download(url, data_dir=data_dir)
+        # Walk the directory to find a CSV
+        for root, _, files in os.walk(data_dir):
+            for f in files:
+                if f.lower().endswith(".csv"):
+                    return os.path.join(root, f)
+        return None
+    except Exception as e:
+        st.warning(f"Kaggle indirme denemesi başarısız: {e}")
+        return None
 
-display(df.head())
-display(df.columns)
+def load_dataframe(kaggle_first: bool = True) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    csv_path = None
+    df = None
+    if kaggle_first and use_kaggle and kaggle_url.strip():
+        csv_path = try_kaggle_download(kaggle_url.strip(), DATA_DIR)
+
+    uploaded = st.file_uploader("Ya da CSV dosyasını buradan yükle (alternatif yöntem):", type=["csv"])
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+        return df, "uploaded"
+    if csv_path is not None and os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        return df, csv_path
+    return None, None
+
+# -------------------- Load Data --------------------
+df, src = load_dataframe(kaggle_first=True)
+if df is None:
+    st.info("Henüz veri yüklenmedi. Soldan Kaggle indir veya yukarıdan bir CSV yükle.")
+    st.stop()
+
+st.success("Veri yüklendi!")
+st.caption(f"Kaynak: {src}")
+
+# -------------------- Preprocess --------------------
+st.subheader("⚙️ Ön İşleme")
+with st.expander("Ön işleme adımları (TOI verisine göre):", expanded=False):
+    st.markdown("""
+- Hedef **`tfopwg_disp`** sütunundan üretilir: `'FP' → 0`, diğerleri → `1` (PLANET).
+- `rowid, toi, toipfx, tid, ctoi_alias` (id) ve `rastr, decstr` (metin) gibi kolonlar modelden düşürülür.
+- Kalan sayısal sütunlar seçilir.
+- Ek özellikler (varsa): `log_trandep`, `dur_per_ratio`, `insol_rad2`, `log_teff`.
+- Eksikler **median** ile doldurulur, ardından **StandardScaler** uygulanır.
+- Sınıf dengesizliği için **SMOTE** kullanılır.
+""")
+
+# Target mapping
+target_col = 'tfopwg_disp'
+assert target_col in df.columns, "tfopwg_disp kolonu bulunamadı!"
+labels = df[target_col].astype(str).str.upper().str.strip()
+y = np.where(labels == 'FP', 0, 1)  # 0=FP, 1=PLANET
 
 id_cols = ['rowid','toi','toipfx','tid','ctoi_alias']
 drop_text_cols = ['rastr','decstr']
-target_col = 'tfopwg_disp'
-assert target_col in df.columns, "tfopwg_disp yok!"
-labels = df[target_col].astype(str).str.upper().str.strip()
-y = np.where(labels == 'FP', 0, 1)
-class_names = ['FP', 'PLANET']
-print("Sınıf dağılımı (0=FP, 1=PLANET):", np.bincount(y))
-X = df.drop(columns=[c for c in (id_cols + drop_text_cols + [target_col]) if c in df.columns], errors='ignore')
-num_cols = X.select_dtypes(include=['number']).columns.tolist()
-X = X[num_cols].copy()
-print(f"Kullanılan {len(num_cols)} sayısal özellik.")
 
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-
-# ====================================================================
-# BÖLÜM 2: İlk Model Eğitimi (Orijinal hali korunmuştur)
-# ====================================================================
-
-# Önişleme Adımları
-numeric_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler())
-])
-preprocess = ColumnTransformer(
-    transformers=[('num', numeric_transformer, num_cols)],
-    remainder='drop'
-)
-
-# Pipeline Tanımlama
-smote = SMOTE(random_state=42, sampling_strategy='auto')
-rf = RandomForestClassifier(
-    n_estimators=500,
-    max_depth=None,
-    min_samples_leaf=1,
-    random_state=42,
-    n_jobs=-1
-)
-imb_pipe = ImbPipeline(steps=[
-    ('prep', preprocess),
-    ('smote', smote),
-    ('model', rf)
-])
-
-# Eğitim ve SMOTE Kontrolü
-imb_pipe.fit(X_train, y_train)
-Xt_tr = preprocess.fit_transform(X_train, y_train)
-Xs, ys = smote.fit_resample(Xt_tr, y_train)
-unique, counts = np.unique(ys, return_counts=True)
-print("SMOTE sonrası eğitimde dağılım:", dict(zip(unique, counts)))
-
-# Değerlendirme
-y_pred  = imb_pipe.predict(X_test)
-y_proba = imb_pipe.predict_proba(X_test)[:, 1]
-print("=== Classification Report ===")
-print(classification_report(y_test, y_pred, target_names=class_names, digits=3))
-cm = confusion_matrix(y_test, y_pred, labels=[0,1])
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-fig, ax = plt.subplots(figsize=(5,5))
-disp.plot(ax=ax, values_format='d', colorbar=False)
-ax.set_title("Confusion Matrix (Binary)")
-plt.tight_layout(); plt.show()
-auc = roc_auc_score(y_test, y_proba)
-print(f"ROC-AUC: {auc:.3f}")
-RocCurveDisplay.from_predictions(y_test, y_proba)
-plt.title("ROC Curve (PLANET = positive)"); plt.show()
-ap = average_precision_score(y_test, y_proba)
-print(f"Average Precision (AP): {ap:.3f}")
-PrecisionRecallDisplay.from_predictions(y_test, y_proba)
-plt.title("Precision–Recall (PLANET = positive)"); plt.show()
-
-# Eşik Optimizasyonu
-ths = np.linspace(0.05, 0.95, 181)
-best_t_pos, best_f1_pos = 0.5, -1
-for t in ths:
-    y_pred_t = (y_proba >= t).astype(int)
-    f1t = f1_score(y_test, y_pred_t)
-    if f1t > best_f1_pos:
-        best_f1_pos, best_t_pos = f1t, t
-print(f"[PLANET=1] En iyi threshold: {best_t_pos:.2f} | F1: {best_f1_pos:.3f}")
-fp_proba = 1 - y_proba
-best_t_fp, best_f1_fp = 0.5, -1
-for t in ths:
-    y_pred_fp = (fp_proba >= t).astype(int)
-    f1t = f1_score((y_test==0).astype(int), y_pred_fp)
-    if f1t > best_f1_fp:
-        best_f1_fp, best_t_fp = f1t, t
-print(f"[FP=1]      En iyi threshold: {best_t_fp:.2f} | F1(FP): {best_f1_fp:.3f}")
-
-y_pred_best = (fp_proba >= best_t_fp).astype(int)
-cm2 = confusion_matrix((y_test==0).astype(int), y_pred_best, labels=[0,1])
-disp2 = ConfusionMatrixDisplay(confusion_matrix=cm2, display_labels=['Not-FP','FP'])
-fig, ax = plt.subplots(figsize=(5,5))
-disp2.plot(ax=ax, values_format='d', colorbar=False)
-ax.set_title(f"Confusion Matrix @ threshold={best_t_fp:.2f} (FP=positive)")
-plt.tight_layout(); plt.show()
-
-# Çapraz Doğrulama (Cross-Validation)
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-bal_acc = cross_val_score(imb_pipe, X, y, cv=cv,
-                          scoring=make_scorer(balanced_accuracy_score), n_jobs=-1)
-f1      = cross_val_score(imb_pipe, X, y, cv=cv, scoring='f1', n_jobs=-1)
-auc     = cross_val_score(imb_pipe, X, y, cv=cv, scoring='roc_auc', n_jobs=-1)
-print("CV Balanced Acc:", np.round(bal_acc,3), "| mean:", bal_acc.mean().round(3))
-print("CV F1 (pos=PLANET):", np.round(f1,3),     "| mean:", f1.mean().round(3))
-print("CV ROC-AUC:", np.round(auc,3),           "| mean:", auc.mean().round(3))
-
-# Önem Skorları (Feature Importance)
-X_test_tr = imb_pipe.named_steps['prep'].transform(X_test)
-rf_fitted  = imb_pipe.named_steps['model']
-feature_names = num_cols # Orijinal özellik adları
-perm = permutation_importance(rf_fitted, X_test_tr, y_test, n_repeats=10, random_state=42, n_jobs=-1)
-perm_df = (pd.DataFrame({'feature': feature_names, 'perm_importance': perm.importances_mean})
-             .sort_values('perm_importance', ascending=False).head(25))
-print("\nPermutation Importances (Initial Model):")
-display(perm_df)
-imp_df = (pd.DataFrame({'feature': feature_names, 'importance': rf_fitted.feature_importances_})
-             .sort_values('importance', ascending=False).head(25))
-print("\nGini Importances (Initial Model):")
-display(imp_df)
-topk = 20
-fig, ax = plt.subplots(figsize=(7,6))
-ax.barh(perm_df['feature'].head(topk)[::-1], perm_df['perm_importance'].head(topk)[::-1])
-ax.set_title("Permutation Importances (Top 20) - Initial")
-plt.tight_layout(); plt.show()
-fig, ax = plt.subplots(figsize=(7,6))
-ax.barh(imp_df['feature'].head(topk)[::-1], imp_df['importance'].head(topk)[::-1])
-ax.set_title("RandomForest Gini Importances (Top 20) - Initial")
-plt.tight_layout(); plt.show()
-
-# ====================================================================
-# BÖLÜM 3: Özellik Mühendisliği (Feature Engineering)
-# ====================================================================
-
+# Feature engineering (conditional)
 df_fe = df.copy()
 if 'pl_trandep' in df_fe.columns:
     df_fe['log_trandep'] = np.log1p(df_fe['pl_trandep'])
@@ -203,101 +95,215 @@ if 'pl_insol' in df_fe.columns and 'st_rad' in df_fe.columns:
     df_fe['insol_rad2'] = df_fe['pl_insol'] / (df_fe['st_rad']**2 + 1e-6)
 if 'st_teff' in df_fe.columns:
     df_fe['log_teff'] = np.log1p(df_fe['st_teff'])
-print("\nYeni eklenen özellikler:", [c for c in df_fe.columns if c not in df.columns])
 
-# YENİ VERİ SETİNİ OLUŞTUR
-labels = df_fe['tfopwg_disp'].astype(str).str.upper().str.strip()
-y = np.where(labels == 'FP', 0, 1)
-class_names = ['FP','PLANET']
 X = df_fe.drop(columns=[c for c in (id_cols + drop_text_cols + [target_col]) if c in df_fe.columns], errors='ignore')
 num_cols = X.select_dtypes(include=['number']).columns.tolist()
 X = X[num_cols].copy()
-print("Yeni özellik sayısı:", len(num_cols))
 
-# ====================================================================
-# BÖLÜM 4: Hata Düzeltme ve Hiperparametre Optimizasyonu (RandomizedSearchCV)
-# ====================================================================
+st.write("Seçilen sayısal özellik sayısı:", len(num_cols))
+st.dataframe(X.head(10))
 
-# DÜZELTME: Yeni num_cols kullanılarak preprocess nesnesi yeniden tanımlanmalıdır.
-numeric_transformer_new = Pipeline(steps=[
+# -------------------- Modeling --------------------
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
+                             RocCurveDisplay, PrecisionRecallDisplay, ConfusionMatrixDisplay,
+                             average_precision_score)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=test_size, random_state=random_state, stratify=y
+)
+
+numeric_transformer = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
     ('scaler', StandardScaler())
 ])
-preprocess_new = ColumnTransformer(
-    transformers=[('num', numeric_transformer_new, num_cols)], # ARTIK YENİ num_cols KULLANILIYOR
+
+preprocess = ColumnTransformer(
+    transformers=[('num', numeric_transformer, num_cols)],
     remainder='drop'
 )
-print("Yeni preprocess nesnesi, genişletilmiş özellik listesiyle oluşturuldu.")
 
-# DÜZELTME: Yeni preprocess ile imb_pipe yeniden tanımlanmalıdır.
-rf = RandomForestClassifier(random_state=42, n_jobs=-1)
-param_dist = {
-    'model__n_estimators': randint(200, 800),
-    'model__max_depth': randint(3, 30),
-    'model__min_samples_split': randint(2, 10),
-    'model__min_samples_leaf': randint(1, 5),
-    'model__max_features': ['sqrt', 'log2', None]
-}
-imb_pipe = ImbPipeline(steps=[
-    ('prep', preprocess_new), # DÜZELTİLMİŞ PREPROCESS KULLANILIYOR
-    ('smote', SMOTE(random_state=42)),
-    ('model', rf)
-])
-
-rs = RandomizedSearchCV(
-    imb_pipe,
-    param_distributions=param_dist,
-    n_iter=30,
-    scoring='f1',
-    cv=3,
-    verbose=2,
-    random_state=42,
+rf = RandomForestClassifier(
+    n_estimators=500,
+    max_depth=None,
+    min_samples_leaf=1,
+    random_state=random_state,
     n_jobs=-1
 )
 
-# Arama işlemini yeni, genişletilmiş X ve y üzerinde gerçekleştir
-rs.fit(X, y)
+imb_pipe = ImbPipeline(steps=[
+    ('prep', preprocess),
+    ('smote', SMOTE(random_state=random_state, sampling_strategy='auto')),
+    ('model', rf)
+])
 
-print("En iyi parametreler:", rs.best_params_)
-print("En iyi CV skoru (F1):", rs.best_score_)
+tabs = st.tabs(["📊 Keşif", "🤖 Model Eğitimi", "📈 Değerlendirme", "⭐ Önem / Permütasyon", "🧪 Çapraz Doğrulama", "💾 İndir / Kaydet"])
 
-# ====================================================================
-# BÖLÜM 5: En İyi Modelin Değerlendirilmesi
-# ====================================================================
+with tabs[0]:
+    st.subheader("Veri Önizleme")
+    st.write("İlk 20 satır:")
+    st.dataframe(df.head(20))
 
-best_model = rs.best_estimator_
+with tabs[1]:
+    st.subheader("Modeli Eğit")
+    if st.button("Eğitimi Başlat"):
+        imb_pipe.fit(X_train, y_train)
+        st.success("Model eğitildi!")
+        st.session_state['model'] = imb_pipe
+    else:
+        st.info("Eğitmek için düğmeye basın.")
 
-# En iyi model için train/test seti yeniden ayrılır (yeni X ve y kullanılır)
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
+with tabs[2]:
+    st.subheader("Test Seti Değerlendirme")
+    if 'model' not in st.session_state:
+        st.warning("Önce modeli eğitmelisiniz (Model Eğitimi sekmesi).")
+    else:
+        model = st.session_state['model']
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1]
 
-# En iyi model, yeniden ayrılmış eğitim verisine fit edilir
-best_model.fit(X_train, y_train)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            acc = (y_pred == y_test).mean()
+            st.metric("Doğruluk", f"{acc:.3f}")
+        with c2:
+            auc = roc_auc_score(y_test, y_proba)
+            st.metric("ROC-AUC", f"{auc:.3f}")
+        with c3:
+            ap = average_precision_score(y_test, y_proba)
+            st.metric("Average Precision", f"{ap:.3f}")
 
-y_pred = best_model.predict(X_test)
-y_proba = best_model.predict_proba(X_test)[:,1]
+        st.code(classification_report(y_test, y_pred, target_names=['FP','PLANET'], digits=3), language="text")
 
-print("\n=== Final Model Classification Report ===")
-print(classification_report(y_test, y_pred, target_names=class_names, digits=3))
-print("ROC-AUC:", roc_auc_score(y_test, y_proba).round(3))
+        # Plots (matplotlib only, no seaborn)
+        import matplotlib.pyplot as plt
+        fig_cm, ax_cm = plt.subplots(figsize=(5,5))
+        ConfusionMatrixDisplay.from_predictions(y_test, y_pred, display_labels=['FP','PLANET'], ax=ax_cm, colorbar=False)
+        ax_cm.set_title("Confusion Matrix")
+        st.pyplot(fig_cm)
 
-# Permutation Importance (Yeni Model)
-rf_fitted = best_model.named_steps['model']
-X_test_tr = best_model.named_steps['prep'].transform(X_test)
+        fig_roc, ax_roc = plt.subplots(figsize=(5,4))
+        RocCurveDisplay.from_predictions(y_test, y_proba, ax=ax_roc, name="RandomForest")
+        ax_roc.set_title("ROC Curve (PLANET = positive)")
+        st.pyplot(fig_roc)
 
-# feature_names_out listesinden 'num__' öneki temizlenir.
-feature_names_out = best_model.named_steps['prep'].get_feature_names_out()
-# Sadece özellik ismini almak için num__ ön eki silinir.
-feature_names_for_plot = [name.split('__')[1] for name in feature_names_out] 
+        fig_pr, ax_pr = plt.subplots(figsize=(5,4))
+        PrecisionRecallDisplay.from_predictions(y_test, y_proba, ax=ax_pr, name="RandomForest")
+        ax_pr.set_title("Precision–Recall (PLANET = positive)")
+        st.pyplot(fig_pr)
 
-perm = permutation_importance(rf_fitted, X_test_tr, y_test, n_repeats=10, random_state=42, n_jobs=-1)
-perm_df = pd.DataFrame({'feature': feature_names_for_plot, 'importance': perm.importances_mean}) \
-             .sort_values('importance', ascending=False).head(20)
+        # Threshold search for FP emphasis
+        ths = np.linspace(0.05, 0.95, 181)
+        from sklearn.metrics import f1_score
+        fp_proba = 1 - y_proba
 
-print("\nPermutation Importances (Final Model):")
-display(perm_df)
+        best_t_fp, best_f1_fp = 0.5, -1
+        for t in ths:
+            y_pred_fp = (fp_proba >= t).astype(int)
+            f1t = f1_score((y_test==0).astype(int), y_pred_fp)
+            if f1t > best_f1_fp:
+                best_f1_fp, best_t_fp = f1t, t
 
-perm_df.plot.barh(x='feature', y='importance', figsize=(8,6), legend=False)
-plt.title("Permutation Importances (Top 20) - Final Model")
-plt.tight_layout(); plt.show()
+        st.info(f"[FP=1] En iyi threshold: **{best_t_fp:.2f}** | F1(FP): **{best_f1_fp:.3f}**")
+
+        y_pred_best = (fp_proba >= best_t_fp).astype(int)
+        fig_cm2, ax_cm2 = plt.subplots(figsize=(5,5))
+        ConfusionMatrixDisplay.from_predictions((y_test==0).astype(int), y_pred_best,
+                                                display_labels=['Not-FP','FP'], ax=ax_cm2, colorbar=False)
+        ax_cm2.set_title(f"Confusion Matrix @ threshold={best_t_fp:.2f} (FP=positive)")
+        st.pyplot(fig_cm2)
+
+with tabs[3]:
+    st.subheader("Özellik Önemleri")
+    if 'model' not in st.session_state:
+        st.warning("Önce modeli eğitmelisiniz (Model Eğitimi sekmesi).")
+    else:
+        model = st.session_state['model']
+        import matplotlib.pyplot as plt
+        # Gini importances
+        rf_fitted = model.named_steps['model']
+        try:
+            gini_imp = rf_fitted.feature_importances_
+            feat_names = model.named_steps['prep'].get_feature_names_out()
+            imp_df = (pd.DataFrame({'feature': feat_names, 'importance': gini_imp})
+                        .sort_values('importance', ascending=False).head(20))
+            fig_gini, ax_gini = plt.subplots(figsize=(7,6))
+            ax_gini.barh(imp_df['feature'][::-1], imp_df['importance'][::-1])
+            ax_gini.set_title("RandomForest Gini Importances (Top 20)")
+            st.pyplot(fig_gini)
+        except Exception as e:
+            st.warning(f"Gini importance görüntülenemedi: {e}")
+
+        # Permutation importances (on test set)
+        try:
+            from sklearn.inspection import permutation_importance
+            X_test_tr = model.named_steps['prep'].transform(X_test)
+            perm = permutation_importance(rf_fitted, X_test_tr, y_test, n_repeats=10,
+                                          random_state=random_state, n_jobs=-1)
+            feat_out = model.named_steps['prep'].get_feature_names_out()
+            perm_df = (pd.DataFrame({'feature': feat_out, 'importance': perm.importances_mean})
+                         .sort_values('importance', ascending=False).head(20))
+            fig_perm, ax_perm = plt.subplots(figsize=(7,6))
+            ax_perm.barh(perm_df['feature'][::-1], perm_df['importance'][::-1])
+            ax_perm.set_title("Permutation Importances (Top 20)")
+            st.pyplot(fig_perm)
+        except Exception as e:
+            st.warning(f"Permutation importance hesaplanamadı: {e}")
+
+with tabs[4]:
+    st.subheader("Çapraz Doğrulama (StratifiedKFold=5)")
+    if 'model' not in st.session_state:
+        st.warning("Önce modeli eğitmelisiniz (Model Eğitimi sekmesi).")
+    else:
+        from sklearn.metrics import make_scorer, balanced_accuracy_score
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        from joblib import parallel_backend
+        with parallel_backend('loky'):
+            bal_acc = cross_val_score(imb_pipe, X, y, cv=cv,
+                                      scoring=make_scorer(balanced_accuracy_score), n_jobs=-1)
+            f1      = cross_val_score(imb_pipe, X, y, cv=cv, scoring='f1', n_jobs=-1)
+            auc     = cross_val_score(imb_pipe, X, y, cv=cv, scoring='roc_auc', n_jobs=-1)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("CV Balanced Acc (mean)", f"{bal_acc.mean():.3f}")
+        with c2:
+            st.metric("CV F1 (mean)", f"{f1.mean():.3f}")
+        with c3:
+            st.metric("CV ROC-AUC (mean)", f"{auc.mean():.3f}")
+        st.write("Balanced Acc:", np.round(bal_acc,3))
+        st.write("F1:", np.round(f1,3))
+        st.write("ROC-AUC:", np.round(auc,3))
+
+with tabs[5]:
+    st.subheader("Veri ve Model İndirme")
+    # Preprocessed CSV
+    st.download_button(
+        label="Ön-işlenmiş veriyi CSV indir",
+        data=X.to_csv(index=False).encode("utf-8"),
+        file_name="toi_preprocessed.csv",
+        mime="text/csv"
+    )
+    # Save model (if exists)
+    if 'model' in st.session_state:
+        import joblib, io
+        memfile = io.BytesIO()
+        joblib.dump(st.session_state['model'], memfile)
+        memfile.seek(0)
+        st.download_button(
+            label="Eğitilmiş modeli indir (.joblib)",
+            data=memfile.read(),
+            file_name="toi_rf_smote_model.joblib",
+            mime="application/octet-stream"
+        )
+    else:
+        st.info("Model henüz eğitilmedi.")
+
+st.caption("Not: Grafikler Matplotlib ile çizilir. Seaborn kullanılmaz. Büyük veri setlerinde ilk yükleme zaman alabilir.")
